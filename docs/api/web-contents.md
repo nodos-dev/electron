@@ -2266,6 +2266,15 @@ When `webPreferences.offscreen.useSharedTexture` is `false` only values between 
 
 Returns `Integer` - If _offscreen rendering_ is enabled returns the current frame rate.
 
+#### `contents.beginFrame(frameTime, interval)` _Experimental_
+
+* `frameTime` number - The frame's time, in milliseconds on the system's monotonic clock. Animations, `requestAnimationFrame` and the frame's `paint` event see this time.
+* `interval` number - The time until the next frame, in milliseconds.
+
+Returns `Promise<boolean>` - Resolves once the frame has been drawn, with whether it changed anything on screen. A frame that did is captured and emitted through the `'paint'` event.
+
+Renders one frame of a page created with `webPreferences.offscreen.externalBeginFrame`. Ask for the next frame only after this one resolves.
+
 #### `contents.invalidate()`
 
 Schedules a full repaint of the window this web contents is in.

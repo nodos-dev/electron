@@ -5,6 +5,7 @@
 #include "shell/browser/api/electron_api_web_contents.h"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <list>
 #include <memory>
@@ -930,6 +931,8 @@ WebContents::WebContents(v8::Isolate* isolate,
                              &offscreen_shared_texture_pixel_format_);
       use_offscreen_dict.Get(options::kDeviceScaleFactor,
                              &offscreen_device_scale_factor_);
+      use_offscreen_dict.Get(options::kExternalBeginFrame,
+                             &offscreen_external_begin_frame_);
     }
   }
 
@@ -977,7 +980,7 @@ WebContents::WebContents(v8::Isolate* isolate,
       auto* view = new OffScreenWebContentsView(
           false, offscreen_use_shared_texture_,
           offscreen_shared_texture_pixel_format_,
-          offscreen_device_scale_factor_,
+          offscreen_device_scale_factor_, false,
           base::BindRepeating(&WebContents::OnPaint, base::Unretained(this)));
       params.view = view;
       params.delegate_view = view;
@@ -1001,6 +1004,7 @@ WebContents::WebContents(v8::Isolate* isolate,
     auto* view = new OffScreenWebContentsView(
         transparent, offscreen_use_shared_texture_,
         offscreen_shared_texture_pixel_format_, offscreen_device_scale_factor_,
+        offscreen_external_begin_frame_,
         base::BindRepeating(&WebContents::OnPaint, base::Unretained(this)));
     params.view = view;
     params.delegate_view = view;
@@ -1447,7 +1451,7 @@ void WebContents::MaybeOverrideCreateParamsForNewWindow(
       auto* view = new OffScreenWebContentsView(
           false, offscreen_use_shared_texture_,
           offscreen_shared_texture_pixel_format_,
-          offscreen_device_scale_factor_, base::DoNothing());
+          offscreen_device_scale_factor_, false, base::DoNothing());
       create_params->view = view;
       create_params->delegate_view = view;
     }
@@ -4301,6 +4305,46 @@ int WebContents::GetFrameRate() const {
   return osr_wcv ? osr_wcv->GetFrameRate() : 0;
 }
 
+v8::Local<v8::Promise> WebContents::BeginFrame(gin::Arguments* args) {
+  gin_helper::Promise<bool> promise(args->isolate());
+  v8::Local<v8::Promise> handle = promise.GetHandle();
+
+  double frame_time = 0;
+  double interval = 0;
+  if (!args->GetNext(&frame_time) || !args->GetNext(&interval) ||
+      !std::isfinite(frame_time) || !std::isfinite(interval) || interval <= 0) {
+    promise.RejectWithErrorMessage(
+        "beginFrame takes a frame time and a positive interval, in "
+        "milliseconds");
+    return handle;
+  }
+  auto* osr_rwhv = offscreen_external_begin_frame_
+                       ? GetOffScreenRenderWidgetHostView()
+                       : nullptr;
+  if (!osr_rwhv) {
+    promise.RejectWithErrorMessage(
+        "beginFrame needs an offscreen page created with externalBeginFrame");
+    return handle;
+  }
+  if (osr_rwhv->begin_frame_pending()) {
+    promise.RejectWithErrorMessage("The previous frame has not finished");
+    return handle;
+  }
+  osr_rwhv->BeginFrame(
+      base::TimeTicks() + base::Milliseconds(frame_time),
+      base::Milliseconds(interval),
+      base::BindOnce(
+          [](gin_helper::Promise<bool> promise, std::optional<bool> has_damage) {
+            if (has_damage)
+              promise.Resolve(*has_damage);
+            else
+              promise.RejectWithErrorMessage(
+                  "The page's view closed before the frame finished");
+          },
+          std::move(promise)));
+  return handle;
+}
+
 void WebContents::Invalidate() {
   if (IsOffScreen()) {
     auto* osr_rwhv = GetOffScreenRenderWidgetHostView();
@@ -5176,6 +5220,7 @@ void WebContents::FillObjectTemplate(v8::Isolate* isolate,
       .SetMethod("setFrameRate", &WebContents::SetFrameRate)
       .SetMethod("getFrameRate", &WebContents::GetFrameRate)
       .SetMethod("invalidate", &WebContents::Invalidate)
+      .SetMethod("beginFrame", &WebContents::BeginFrame)
       .SetMethod("setZoomLevel", &WebContents::SetZoomLevel)
       .SetMethod("getZoomLevel", &WebContents::GetZoomLevel)
       .SetMethod("setZoomFactor", &WebContents::SetZoomFactor)

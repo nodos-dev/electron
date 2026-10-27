@@ -113,7 +113,11 @@ void OffScreenVideoConsumer::SetActive(bool active) {
 }
 
 void OffScreenVideoConsumer::SetFrameRate(int frame_rate) {
-  video_capturer_->SetMinCapturePeriod(base::Seconds(1) / frame_rate);
+  // With external begin frames every frame asked for is captured, however
+  // close their frame times are.
+  video_capturer_->SetMinCapturePeriod(view_->external_begin_frame()
+                                           ? base::TimeDelta()
+                                           : base::Seconds(1) / frame_rate);
 }
 
 void OffScreenVideoConsumer::OnFrameCaptured(
@@ -149,6 +153,10 @@ void OffScreenVideoConsumer::OnFrameCaptured(
     texture.color_space = info->color_space;
     texture.timestamp = info->timestamp.InMicroseconds();
     texture.frame_count = info->metadata.capture_counter.value_or(0);
+    if (info->metadata.reference_time)
+      texture.reference_time =
+          (*info->metadata.reference_time - base::TimeTicks())
+              .InMillisecondsF();
     texture.capture_update_rect = info->metadata.capture_update_rect;
     texture.source_size = info->metadata.source_size;
     texture.region_capture_rect = info->metadata.region_capture_rect;

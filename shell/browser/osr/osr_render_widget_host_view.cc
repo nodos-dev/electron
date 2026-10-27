@@ -153,6 +153,7 @@ OffScreenRenderWidgetHostView::OffScreenRenderWidgetHostView(
     bool offscreen_use_shared_texture,
     const std::string& offscreen_shared_texture_pixel_format,
     float offscreen_device_scale_factor,
+    bool offscreen_external_begin_frame,
     bool painting,
     int frame_rate,
     const OnPaintCallback& callback,
@@ -169,6 +170,8 @@ OffScreenRenderWidgetHostView::OffScreenRenderWidgetHostView(
       offscreen_device_scale_factor_(offscreen_device_scale_factor),
       callback_(callback),
       frame_rate_(frame_rate),
+      // Popups composite into their parent and keep their own timer.
+      external_begin_frame_(offscreen_external_begin_frame && !parent_host_view),
       size_(initial_size),
       painting_(painting),
       delegated_frame_host_client_{
@@ -201,8 +204,7 @@ OffScreenRenderWidgetHostView::OffScreenRenderWidgetHostView(
   compositor_ = std::make_unique<ui::Compositor>(
       context_factory->AllocateFrameSinkId(), context_factory,
       base::SingleThreadTaskRunner::GetCurrentDefault(),
-      false /* enable_pixel_canvas */,
-      false /* use_external_begin_frame_control */);
+      false /* enable_pixel_canvas */, external_begin_frame_);
   compositor_->SetAcceleratedWidget(gfx::kNullAcceleratedWidget);
   compositor_->SetDelegate(this);
   compositor_->SetRootLayer(root_layer_.get());
@@ -243,6 +245,13 @@ OffScreenRenderWidgetHostView::~OffScreenRenderWidgetHostView() {
 }
 
 void OffScreenRenderWidgetHostView::ReleaseCompositor() {
+  // The view is going away: tell the caller of a frame in progress later,
+  // outside this teardown.
+  if (begin_frame_callback_) {
+    content::GetUIThreadTaskRunner({})->PostTask(
+        FROM_HERE,
+        base::BindOnce(std::move(begin_frame_callback_), std::nullopt));
+  }
   if (!compositor_) {
     return;  // already released
   }
@@ -899,6 +908,28 @@ void OffScreenRenderWidgetHostView::SetFrameRate(int frame_rate) {
 const viz::LocalSurfaceId& OffScreenRenderWidgetHostView::GetLocalSurfaceId()
     const {
   return delegated_frame_host_surface_id_;
+}
+
+void OffScreenRenderWidgetHostView::BeginFrame(base::TimeTicks frame_time,
+                                               base::TimeDelta interval,
+                                               BeginFrameCallback callback) {
+  DCHECK(external_begin_frame_);
+  DCHECK(!begin_frame_callback_);
+  begin_frame_callback_ = std::move(callback);
+  const viz::BeginFrameArgs args = viz::BeginFrameArgs::Create(
+      BEGINFRAME_FROM_HERE, viz::BeginFrameArgs::kManualSourceId,
+      ++begin_frame_number_, frame_time, frame_time + interval, interval,
+      viz::BeginFrameArgs::NORMAL);
+  render_widget_host_->ProgressFlingIfNeeded(frame_time);
+  compositor_->IssueExternalBeginFrame(
+      args, base::BindOnce(&OffScreenRenderWidgetHostView::OnBeginFrameDone,
+                           weak_ptr_factory_.GetWeakPtr()));
+}
+
+void OffScreenRenderWidgetHostView::OnBeginFrameDone(
+    const viz::BeginFrameAck& ack) {
+  if (begin_frame_callback_)
+    std::move(begin_frame_callback_).Run(ack.has_damage);
 }
 
 void OffScreenRenderWidgetHostView::SetupFrameRate(bool force) {

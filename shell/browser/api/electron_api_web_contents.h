@@ -336,6 +336,7 @@ class WebContents final : public ExclusiveAccessContext,
   void SetFrameRate(int frame_rate);
   int GetFrameRate() const;
   void Invalidate();
+  v8::Local<v8::Promise> BeginFrame(gin::Arguments* args);
   gfx::Size GetSizeForNewRenderView(content::WebContents*) override;
 
   // Methods for zoom handling.
@@ -883,6 +884,9 @@ class WebContents final : public ExclusiveAccessContext,
 
   // Use 1.0f for consistent behavior.
   float offscreen_device_scale_factor_ = 1.0f;
+
+  // Whether the page renders a frame only when beginFrame asks for one.
+  bool offscreen_external_begin_frame_ = false;
 
   // Whether window is fullscreened by HTML5 api.
   bool html_fullscreen_ = false;

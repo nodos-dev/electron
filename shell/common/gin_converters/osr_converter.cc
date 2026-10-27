@@ -116,6 +116,7 @@ v8::Local<v8::Value> Converter<electron::OffscreenSharedTextureValue>::ToV8(
   metadata.Set("regionCaptureRect", val.region_capture_rect);
   metadata.Set("sourceSize", val.source_size);
   metadata.Set("frameCount", val.frame_count);
+  metadata.Set("referenceTime", val.reference_time);
   dict.Set("metadata", ConvertToV8(isolate, metadata));
 
   gin::Dictionary sharedTexture(isolate, v8::Object::New(isolate));

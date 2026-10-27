@@ -92,6 +92,10 @@ struct OffscreenSharedTextureValue {
   // The frame count
   int64_t frame_count;
 
+  // The time the frame was drawn for, in milliseconds on the system's
+  // monotonic clock.
+  std::optional<double> reference_time;
+
   // Releaser holder
   raw_ptr<OffscreenReleaserHolder> releaser_holder;
 

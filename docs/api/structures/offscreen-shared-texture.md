@@ -16,6 +16,7 @@
     * `regionCaptureRect` [Rectangle](rectangle.md) (optional) - May reflect the frame's contents origin if region capture is used internally.
     * `sourceSize` [Rectangle](rectangle.md) (optional) - Full size of the source frame.
     * `frameCount` number (optional) - The increasing count of captured frame. May contain gaps if frames are dropped between two consecutively received frames.
+    * `referenceTime` number (optional) - The time the frame was drawn for, in milliseconds on the system's monotonic clock.
   * `handle` [SharedTextureHandle](shared-texture-handle.md) - The shared texture handle data.
 * `release` Function - Release the resources. The `texture` cannot be directly passed to another process, users need to maintain texture lifecycles in
   main process, but it is safe to pass the `textureInfo` to another process. Only a limited number of textures can exist at the same time, so it's important that you call `texture.release()` as soon as you're done with the texture.

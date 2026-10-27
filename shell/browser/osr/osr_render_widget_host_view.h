@@ -6,6 +6,7 @@
 #define ELECTRON_SHELL_BROWSER_OSR_OSR_RENDER_WIDGET_HOST_VIEW_H_
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -58,6 +59,10 @@ class ElectronDelegatedFrameHostClient;
 class OffScreenHostDisplayClient;
 
 using OnPopupPaintCallback = base::RepeatingCallback<void(const gfx::Rect&)>;
+// Whether the frame changed anything on screen; empty when the view closed
+// before the frame finished.
+using BeginFrameCallback =
+    base::OnceCallback<void(std::optional<bool> has_damage)>;
 
 class OffScreenRenderWidgetHostView
     : public content::RenderWidgetHostViewBase,
@@ -70,6 +75,7 @@ class OffScreenRenderWidgetHostView
       bool offscreen_use_shared_texture,
       const std::string& offscreen_shared_texture_pixel_format,
       float offscreen_device_scale_factor,
+      bool offscreen_external_begin_frame,
       bool painting,
       int frame_rate,
       const OnPaintCallback& callback,
@@ -231,6 +237,14 @@ class OffScreenRenderWidgetHostView
   void SetFrameRate(int frame_rate);
   int frame_rate() const { return frame_rate_; }
 
+  // With external begin frames the page renders a frame only when asked, with
+  // the frame time given, instead of on the view's own timer.
+  bool external_begin_frame() const { return external_begin_frame_; }
+  void BeginFrame(base::TimeTicks frame_time,
+                  base::TimeDelta interval,
+                  BeginFrameCallback callback);
+  bool begin_frame_pending() const { return !!begin_frame_callback_; }
+
   bool offscreen_use_shared_texture() const {
     return offscreen_use_shared_texture_;
   }
@@ -264,6 +278,7 @@ class OffScreenRenderWidgetHostView
 
  private:
   void ReleaseCompositor();
+  void OnBeginFrameDone(const viz::BeginFrameAck& ack);
   void SetupFrameRate(bool force);
   void ResizeRootLayer(bool force);
 
@@ -292,6 +307,11 @@ class OffScreenRenderWidgetHostView
 
   int frame_rate_ = 0;
   int frame_rate_threshold_us_ = 0;
+
+  const bool external_begin_frame_;
+  // The caller of the frame being produced, if any.
+  BeginFrameCallback begin_frame_callback_;
+  uint64_t begin_frame_number_ = viz::BeginFrameArgs::kStartingFrameNumber;
 
   gfx::Size size_;
   bool painting_;

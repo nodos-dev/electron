@@ -204,6 +204,8 @@ inline constexpr std::string_view kSharedTexturePixelFormat =
 
 inline constexpr std::string_view kDeviceScaleFactor = "deviceScaleFactor";
 
+inline constexpr std::string_view kExternalBeginFrame = "externalBeginFrame";
+
 inline constexpr std::string_view kNodeIntegrationInSubFrames =
     "nodeIntegrationInSubFrames";
 

@@ -1,0 +1,268 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: M. Samil Atesoglu <samil.atesoglu@nodos.dev>
+Date: Wed, 28 Oct 2026 13:00:00 +0300
+Subject: Fix pages freezing under virtual time while they wait for the clock
+
+Virtual time stands still while a task runs. A page that waits for
+performance.now() or Date.now() to change, as pages that measure the
+clock's resolution do, loops forever: its task never ends, so the virtual
+time budget is never spent and no frame is drawn again.
+
+While time is overridden, the clock page script reads moves on by a
+microsecond for each reading that would not be later than the last, as
+time passes while script runs in a browser. Virtual time itself, and so
+timers and frame times, is unaffected; script's clock goes back to
+reading it once virtual time passes the readings.
+
+diff --git a/gin/public/v8_platform.h b/gin/public/v8_platform.h
+index ea6f2b35c52312dd2f93e92ec4ed78e65aa3fecf..c0968807d55f1165d017e389350946f2d335e7da 100644
+--- a/gin/public/v8_platform.h
++++ b/gin/public/v8_platform.h
+@@ -5,8 +5,11 @@
+ #ifndef GIN_PUBLIC_V8_PLATFORM_H_
+ #define GIN_PUBLIC_V8_PLATFORM_H_
+ 
++#include <atomic>
++
+ #include "base/compiler_specific.h"
+ #include "base/lazy_instance.h"
++#include "base/time/time.h"
+ #include "gin/gin_export.h"
+ #include "gin/time_clamper.h"
+ #include "gin/v8_platform_page_allocator.h"
+@@ -68,15 +71,22 @@ class GIN_EXPORT V8Platform : public v8::Platform {
+   v8::TracingController* GetTracingController() override;
+   void DumpWithoutCrashing() override;
+ 
++  // Sets the clock script reads the time of day from, as Date.now() does.
++  // Null restores base::Time::Now.
++  void SetNowForScript(base::Time (*now_for_script)());
++
+  private:
+   friend struct base::LazyInstanceTraitsBase<V8Platform>;
+ 
+   V8Platform();
+   ~V8Platform() override;
+ 
++  base::Time NowForScript() const;
++
+   class TracingControllerImpl;
+   std::unique_ptr<TracingControllerImpl> tracing_controller_;
+   TimeClamper time_clamper_;
++  std::atomic<base::Time (*)()> now_for_script_{nullptr};
+ };
+ 
+ }  // namespace gin
+diff --git a/gin/v8_platform.cc b/gin/v8_platform.cc
+index d68dd800adaee1b59dd2c5aee87f8b0a51731a4f..e40ce0d12ea8e4265926bd63bd8916388a77685c 100644
+--- a/gin/v8_platform.cc
++++ b/gin/v8_platform.cc
+@@ -341,16 +341,25 @@ double V8Platform::MonotonicallyIncreasingTime() {
+       static_cast<double>(base::Time::kMicrosecondsPerSecond);
+ }
+ 
++void V8Platform::SetNowForScript(base::Time (*now_for_script)()) {
++  now_for_script_.store(now_for_script, std::memory_order_release);
++}
++
+ double V8Platform::CurrentClockTimeMillis() {
+-  return static_cast<double>(time_clamper_.ClampToMillis(base::Time::Now()));
++  return static_cast<double>(time_clamper_.ClampToMillis(NowForScript()));
+ }
+ 
+ int64_t V8Platform::CurrentClockTimeMilliseconds() {
+-  return time_clamper_.ClampToMillis(base::Time::Now());
++  return time_clamper_.ClampToMillis(NowForScript());
+ }
+ 
+ double V8Platform::CurrentClockTimeMillisecondsHighResolution() {
+-  return time_clamper_.ClampToMillisHighResolution(base::Time::Now());
++  return time_clamper_.ClampToMillisHighResolution(NowForScript());
++}
++
++base::Time V8Platform::NowForScript() const {
++  auto now_for_script = now_for_script_.load(std::memory_order_acquire);
++  return now_for_script ? now_for_script() : base::Time::Now();
+ }
+ 
+ v8::TracingController* V8Platform::GetTracingController() {
+diff --git a/third_party/blink/renderer/core/timing/performance.cc b/third_party/blink/renderer/core/timing/performance.cc
+index a6040f83e19267bf805c47c357c6c9ed4661392b..a5a574e5b1b9d353c8449f736deb104c5d7275fd 100644
+--- a/third_party/blink/renderer/core/timing/performance.cc
++++ b/third_party/blink/renderer/core/timing/performance.cc
+@@ -101,6 +101,7 @@
+ #include "third_party/blink/renderer/platform/loader/fetch/resource_timing_utils.h"
+ #include "third_party/blink/renderer/platform/network/http_parsers.h"
+ #include "third_party/blink/renderer/platform/runtime_enabled_features.h"
++#include "third_party/blink/renderer/platform/scheduler/common/process_time_override_coordinator.h"
+ #include "third_party/blink/renderer/platform/weborigin/security_origin.h"
+ #include "v8/include/v8-metrics.h"
+ 
+@@ -1343,7 +1344,8 @@ DOMHighResTimeStamp Performance::MonotonicTimeToDOMHighResTimeStamp(
+ }
+ 
+ DOMHighResTimeStamp Performance::now() const {
+-  return MonotonicTimeToDOMHighResTimeStamp(base::TimeTicks::Now());
++  return MonotonicTimeToDOMHighResTimeStamp(
++      scheduler::ProcessTimeOverrideCoordinator::NowTicksForScript());
+ }
+ 
+ // static
+diff --git a/third_party/blink/renderer/platform/scheduler/BUILD.gn b/third_party/blink/renderer/platform/scheduler/BUILD.gn
+index 548256efd869892238f5b909fb6522d2d8c05185..16069cdee6470ac775735d2936ddfc0971364622 100644
+--- a/third_party/blink/renderer/platform/scheduler/BUILD.gn
++++ b/third_party/blink/renderer/platform/scheduler/BUILD.gn
+@@ -176,6 +176,7 @@ blink_platform_sources("scheduler") {
+     "//cc",
+     "//components/performance_manager/scenario_api",
+     "//device/base/synchronization",
++    "//gin",
+     "//services/metrics/public/mojom",
+     "//third_party/blink/renderer/platform:allow_discouraged_type",
+     "//third_party/blink/renderer/platform:make_platform_generated",
+diff --git a/third_party/blink/renderer/platform/scheduler/DEPS b/third_party/blink/renderer/platform/scheduler/DEPS
+index 4a044e38a115173262628c298c1de3f9b6d43d4e..f8bd5085b0d224807cc80c6e1b0a49868569ddc2 100644
+--- a/third_party/blink/renderer/platform/scheduler/DEPS
++++ b/third_party/blink/renderer/platform/scheduler/DEPS
+@@ -28,6 +28,7 @@ include_rules = [
+   "+base/threading/sequenced_task_runner_handle.h",
+   "+base/threading/thread.h",
+   "+base/traits_bag.h",
++  "+gin/public/v8_platform.h",
+   "+services/metrics",
+ 
+   "+third_party/blink/renderer/platform/allow_discouraged_type.h",
+diff --git a/third_party/blink/renderer/platform/scheduler/common/process_time_override_coordinator.cc b/third_party/blink/renderer/platform/scheduler/common/process_time_override_coordinator.cc
+index 193f361fd96ea2f10e3283e71662e73fd5180966..e7ca0900f5a3cd93ede7170bcc032d66e4173e91 100644
+--- a/third_party/blink/renderer/platform/scheduler/common/process_time_override_coordinator.cc
++++ b/third_party/blink/renderer/platform/scheduler/common/process_time_override_coordinator.cc
+@@ -4,8 +4,15 @@
+ 
+ #include "third_party/blink/renderer/platform/scheduler/common/process_time_override_coordinator.h"
+ 
++#include <algorithm>
++
++#include "gin/public/v8_platform.h"
++
+ namespace blink::scheduler {
+ 
++// How far each reading moves script's clock on while time stands still.
++constexpr base::TimeDelta kScriptReadStep = base::Microseconds(1);
++
+ ProcessTimeOverrideCoordinator::ScopedOverride::ScopedOverride(
+     base::RepeatingClosure schedule_work_callback)
+     : schedule_work_callback_(std::move(schedule_work_callback)) {}
+@@ -82,14 +89,18 @@ void ProcessTimeOverrideCoordinator::EnableOverride(
+   clock_override_ = std::make_unique<base::subtle::ScopedTimeClockOverrides>(
+       &ProcessTimeOverrideCoordinator::CurrentTime,
+       &ProcessTimeOverrideCoordinator::CurrentTicks, nullptr);
++  gin::V8Platform::Get()->SetNowForScript(
++      &ProcessTimeOverrideCoordinator::NowForScript);
+ }
+ 
+ void ProcessTimeOverrideCoordinator::DisableOverride() {
+   DCHECK(clock_override_);
++  gin::V8Platform::Get()->SetNowForScript(nullptr);
+   clock_override_.reset();
+   // This is only to keep tests happy, as we may re-enable overrides again
+   // and expect time to increase monotonically.
+   current_ticks_.store(base::TimeTicks(), std::memory_order_release);
++  last_script_ticks_.store(base::TimeTicks(), std::memory_order_relaxed);
+ }
+ 
+ base::TimeTicks ProcessTimeOverrideCoordinator::TryAdvancingTime(
+@@ -153,4 +164,27 @@ base::TimeTicks ProcessTimeOverrideCoordinator::CurrentTicks() {
+   return ticks.is_null() ? base::subtle::TimeTicksNowIgnoringOverride() : ticks;
+ }
+ 
++base::TimeTicks ProcessTimeOverrideCoordinator::NowTicksForScript() {
++  auto& self = ProcessTimeOverrideCoordinator::Instance();
++  const auto ticks = self.current_ticks_.load(std::memory_order_acquire);
++  if (ticks.is_null()) {
++    return base::TimeTicks::Now();
++  }
++  auto last = self.last_script_ticks_.load(std::memory_order_relaxed);
++  base::TimeTicks next;
++  do {
++    next = std::max(ticks, last + kScriptReadStep);
++  } while (!self.last_script_ticks_.compare_exchange_weak(
++      last, next, std::memory_order_relaxed));
++  return next;
++}
++
++base::Time ProcessTimeOverrideCoordinator::NowForScript() {
++  auto& self = ProcessTimeOverrideCoordinator::Instance();
++  if (self.current_ticks_.load(std::memory_order_acquire).is_null()) {
++    return base::Time::Now();
++  }
++  return self.initial_time_ + (NowTicksForScript() - self.initial_ticks_);
++}
++
+ }  // namespace blink::scheduler
+diff --git a/third_party/blink/renderer/platform/scheduler/common/process_time_override_coordinator.h b/third_party/blink/renderer/platform/scheduler/common/process_time_override_coordinator.h
+index 9d2f4b74bdc896b18c8403bd3ead1dbed69d214c..82e50087e3e8ea932cf091cb7eca92e3fda884fa 100644
+--- a/third_party/blink/renderer/platform/scheduler/common/process_time_override_coordinator.h
++++ b/third_party/blink/renderer/platform/scheduler/common/process_time_override_coordinator.h
+@@ -63,6 +63,13 @@ class PLATFORM_EXPORT ProcessTimeOverrideCoordinator {
+       base::TimeTicks requested_ticks,
+       base::RepeatingClosure schedule_work_callback);
+ 
++  // The time page script reads, as performance.now() and Date.now() do. While
++  // time is overridden it stands still during a task, so a reading that would
++  // not be later than the last one moves on by a microsecond, as time passes
++  // while script runs. A page that waits for the clock to change stops waiting.
++  static base::TimeTicks NowTicksForScript();
++  static base::Time NowForScript();
++
+  private:
+   friend class base::NoDestructor<ProcessTimeOverrideCoordinator>;
+ 
+@@ -96,6 +103,8 @@ class PLATFORM_EXPORT ProcessTimeOverrideCoordinator {
+   base::TimeTicks initial_ticks_;
+ 
+   std::atomic<base::TimeTicks> current_ticks_;
++  // The last time NowTicksForScript() returned.
++  std::atomic<base::TimeTicks> last_script_ticks_;
+ 
+   base::Lock lock_;
+   std::unique_ptr<base::subtle::ScopedTimeClockOverrides> clock_override_
+diff --git a/third_party/blink/renderer/platform/scheduler/common/process_time_override_coordinator_unittest.cc b/third_party/blink/renderer/platform/scheduler/common/process_time_override_coordinator_unittest.cc
+index 1b12c47d8507e2461db16c1334253e3c79ed41ee..58b8d2203ceeaf5893272fa5e34e3aa683f5ef19 100644
+--- a/third_party/blink/renderer/platform/scheduler/common/process_time_override_coordinator_unittest.cc
++++ b/third_party/blink/renderer/platform/scheduler/common/process_time_override_coordinator_unittest.cc
+@@ -2,6 +2,7 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
++#include "base/functional/callback_helpers.h"
+ #include "base/test/bind.h"
+ #include "testing/gmock/include/gmock/gmock.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+@@ -113,6 +114,27 @@ TEST(ProcessTimeOverrideCoordinatorTest, MultipleClients) {
+   EXPECT_THAT(client2_callback_count, Eq(1));
+ }
+ 
++TEST(ProcessTimeOverrideCoordinatorTest, ScriptClockMovesWhileTimeStandsStill) {
++  const base::TimeTicks start_ticks = base::TimeTicks::Now() + base::Seconds(5);
++  auto time_override = ProcessTimeOverrideCoordinator::CreateOverride(
++      kStartTime, start_ticks, base::DoNothing());
++
++  // Each reading while time stands still is a microsecond later than the last.
++  EXPECT_THAT(ProcessTimeOverrideCoordinator::NowTicksForScript(),
++              Eq(start_ticks));
++  EXPECT_THAT(ProcessTimeOverrideCoordinator::NowTicksForScript(),
++              Eq(start_ticks + base::Microseconds(1)));
++  EXPECT_THAT(ProcessTimeOverrideCoordinator::NowForScript(),
++              Eq(kStartTime + base::Microseconds(2)));
++  // The time everything else reads stays where it is.
++  EXPECT_THAT(base::TimeTicks::Now(), Eq(start_ticks));
++
++  // Once time moves past the readings, script reads it again.
++  time_override->TryAdvancingTime(start_ticks + base::Milliseconds(16));
++  EXPECT_THAT(ProcessTimeOverrideCoordinator::NowTicksForScript(),
++              Eq(start_ticks + base::Milliseconds(16)));
++}
++
+ }  // namespace
+ 
+ }  // namespace blink::scheduler

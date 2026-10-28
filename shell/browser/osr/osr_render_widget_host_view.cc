@@ -250,7 +250,8 @@ void OffScreenRenderWidgetHostView::ReleaseCompositor() {
   if (begin_frame_callback_) {
     content::GetUIThreadTaskRunner({})->PostTask(
         FROM_HERE,
-        base::BindOnce(std::move(begin_frame_callback_), std::nullopt));
+        base::BindOnce(std::move(begin_frame_callback_),
+                       BeginFrameResult::kViewClosed));
   }
   if (!compositor_) {
     return;  // already released
@@ -921,6 +922,9 @@ void OffScreenRenderWidgetHostView::BeginFrame(base::TimeTicks frame_time,
       ++begin_frame_number_, frame_time, frame_time + interval, interval,
       viz::BeginFrameArgs::NORMAL);
   render_widget_host_->ProgressFlingIfNeeded(frame_time);
+  // Every frame asked for is drawn in full, so it is captured whether or not
+  // the page changed; the capturer watches this compositor's output.
+  compositor_->ScheduleFullRedraw();
   compositor_->IssueExternalBeginFrame(
       args, base::BindOnce(&OffScreenRenderWidgetHostView::OnBeginFrameDone,
                            weak_ptr_factory_.GetWeakPtr()));
@@ -929,7 +933,9 @@ void OffScreenRenderWidgetHostView::BeginFrame(base::TimeTicks frame_time,
 void OffScreenRenderWidgetHostView::OnBeginFrameDone(
     const viz::BeginFrameAck& ack) {
   if (begin_frame_callback_)
-    std::move(begin_frame_callback_).Run(ack.has_damage);
+    std::move(begin_frame_callback_)
+        .Run(ack.has_damage ? BeginFrameResult::kDrawn
+                            : BeginFrameResult::kNothingDrawn);
 }
 
 void OffScreenRenderWidgetHostView::SetupFrameRate(bool force) {

@@ -59,10 +59,9 @@ class ElectronDelegatedFrameHostClient;
 class OffScreenHostDisplayClient;
 
 using OnPopupPaintCallback = base::RepeatingCallback<void(const gfx::Rect&)>;
-// Whether the frame changed anything on screen; empty when the view closed
-// before the frame finished.
-using BeginFrameCallback =
-    base::OnceCallback<void(std::optional<bool> has_damage)>;
+// How a frame asked for with BeginFrame ended. A drawn frame is captured.
+enum class BeginFrameResult { kDrawn, kNothingDrawn, kViewClosed };
+using BeginFrameCallback = base::OnceCallback<void(BeginFrameResult result)>;
 
 class OffScreenRenderWidgetHostView
     : public content::RenderWidgetHostViewBase,

@@ -4306,7 +4306,7 @@ int WebContents::GetFrameRate() const {
 }
 
 v8::Local<v8::Promise> WebContents::BeginFrame(gin::Arguments* args) {
-  gin_helper::Promise<bool> promise(args->isolate());
+  gin_helper::Promise<void> promise(args->isolate());
   v8::Local<v8::Promise> handle = promise.GetHandle();
 
   double frame_time = 0;
@@ -4334,12 +4334,20 @@ v8::Local<v8::Promise> WebContents::BeginFrame(gin::Arguments* args) {
       base::TimeTicks() + base::Milliseconds(frame_time),
       base::Milliseconds(interval),
       base::BindOnce(
-          [](gin_helper::Promise<bool> promise, std::optional<bool> has_damage) {
-            if (has_damage)
-              promise.Resolve(*has_damage);
-            else
-              promise.RejectWithErrorMessage(
-                  "The page's view closed before the frame finished");
+          [](gin_helper::Promise<void> promise, BeginFrameResult result) {
+            switch (result) {
+              case BeginFrameResult::kDrawn:
+                promise.Resolve();
+                return;
+              case BeginFrameResult::kNothingDrawn:
+                promise.RejectWithErrorMessage(
+                    "The frame was not drawn, so it has no capture");
+                return;
+              case BeginFrameResult::kViewClosed:
+                promise.RejectWithErrorMessage(
+                    "The page's view closed before the frame finished");
+                return;
+            }
           },
           std::move(promise)));
   return handle;

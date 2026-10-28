@@ -66,6 +66,14 @@ OffScreenVideoConsumer::OffScreenVideoConsumer(
     : callback_(callback),
       view_(view),
       video_capturer_(view->CreateVideoCapturer()) {
+  // With external begin frames the capture is of the view's compositor, which
+  // draws every frame asked for, not of the page inside it, which draws only
+  // when it changes.
+  if (view->external_begin_frame()) {
+    video_capturer_->ChangeTarget(
+        viz::VideoCaptureTarget(view->GetCompositor()->frame_sink_id()),
+        /*sub_capture_target_version=*/0);
+  }
   video_capturer_->SetAutoThrottlingEnabled(false);
   video_capturer_->SetMinSizeChangePeriod(base::TimeDelta());
 

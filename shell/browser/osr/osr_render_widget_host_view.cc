@@ -208,6 +208,10 @@ OffScreenRenderWidgetHostView::OffScreenRenderWidgetHostView(
   compositor_->SetAcceleratedWidget(gfx::kNullAcceleratedWidget);
   compositor_->SetDelegate(this);
   compositor_->SetRootLayer(root_layer_.get());
+  // A navigation can replace the widget without creating a new RenderView, so
+  // every compositor must start with the requested background transparency.
+  if (transparent_)
+    compositor_->SetBackgroundColor(SK_ColorTRANSPARENT);
 
   ResizeRootLayer(false);
 
@@ -617,7 +621,6 @@ OffScreenRenderWidgetHostView::CreateHostDisplayClient(
 bool OffScreenRenderWidgetHostView::InstallTransparency() {
   if (transparent_) {
     SetBackgroundColor(SkColor());
-    compositor_->SetBackgroundColor(SK_ColorTRANSPARENT);
     return true;
   }
   return false;

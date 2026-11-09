@@ -13,6 +13,7 @@
 #include "services/viz/privileged/mojom/compositing/frame_sink_video_capture.mojom.h"
 #include "third_party/skia/include/core/SkCanvas.h"
 #include "ui/gfx/canvas.h"
+#include "ui/gfx/gpu_fence_handle.h"
 #include "ui/gfx/native_ui_types.h"
 
 #include <cstdint>
@@ -49,6 +50,10 @@ struct OffscreenReleaserHolder {
 
   // GpuMemoryBufferHandle, keep the scoped handle alive
   gfx::GpuMemoryBufferHandle gmb_handle;
+#if BUILDFLAG(IS_WIN)
+  gfx::GpuFenceHandle ready_fence;
+  uint64_t ready_fence_value = 0;
+#endif
 
   // Releaser, hold this to prevent FrameSinkVideoCapturer recycle frame
   mojo::PendingRemote<viz::mojom::FrameSinkVideoConsumerFrameCallbacks>

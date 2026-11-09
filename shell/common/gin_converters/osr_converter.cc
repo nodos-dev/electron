@@ -126,6 +126,17 @@ v8::Local<v8::Value> Converter<electron::OffscreenSharedTextureValue>::ToV8(
       electron::Buffer::Copy(
           isolate, base::byte_span_from_ref(val.shared_texture_handle))
           .ToLocalChecked());
+  const auto& ready = *val.releaser_holder;
+  if (!ready.ready_fence.is_null()) {
+    const auto handle = reinterpret_cast<uintptr_t>(ready.ready_fence.Peek());
+    sharedTexture.Set("readyFenceHandle",
+                      electron::Buffer::Copy(
+                          isolate, base::byte_span_from_ref(handle))
+                          .ToLocalChecked());
+    v8::Local<v8::Value> value =
+        v8::BigInt::NewFromUnsigned(isolate, ready.ready_fence_value);
+    sharedTexture.Set("readyFenceValue", value);
+  }
 #elif BUILDFLAG(IS_MAC)
   sharedTexture.Set(
       "ioSurface",

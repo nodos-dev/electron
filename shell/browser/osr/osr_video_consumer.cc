@@ -6,6 +6,7 @@
 
 #include <utility>
 
+#include "base/command_line.h"
 #include "media/base/limits.h"
 #include "media/base/video_frame_metadata.h"
 #include "media/capture/mojom/video_capture_buffer.mojom.h"
@@ -110,11 +111,21 @@ OffScreenVideoConsumer::~OffScreenVideoConsumer() = default;
 
 void OffScreenVideoConsumer::SetActive(bool active) {
   if (active) {
-    video_capturer_->Start(
-        this,
-        view_->offscreen_use_shared_texture()
-            ? viz::mojom::BufferFormatPreference::kPreferMappableSharedImage
-            : viz::mojom::BufferFormatPreference::kDefault);
+    auto preference = view_->offscreen_use_shared_texture()
+                          ? viz::mojom::BufferFormatPreference::kPreferMappableSharedImage
+                          : viz::mojom::BufferFormatPreference::kDefault;
+#if BUILDFLAG(IS_WIN)
+    if (view_->offscreen_use_shared_texture() && view_->external_begin_frame() &&
+        GetTargetPixelFormatFromOption(
+            view_->offscreen_shared_texture_pixel_format()) ==
+            media::PIXEL_FORMAT_ARGB &&
+        base::CommandLine::ForCurrentProcess()->HasSwitch(
+            "offscreen-shared-texture-fence")) {
+      preference =
+          viz::mojom::BufferFormatPreference::kPreferFencedMappableSharedImage;
+    }
+#endif
+    video_capturer_->Start(this, preference);
   } else {
     video_capturer_->Stop();
   }
@@ -140,12 +151,15 @@ void OffScreenVideoConsumer::OnFrameCaptured(
 
   // Offscreen using GPU shared texture
   if (view_->offscreen_use_shared_texture()) {
-    if (!data->is_gpu_memory_buffer_handle() ||
+    if ((!data->is_gpu_memory_buffer_handle() &&
+         !data->is_fenced_d3d11_buffer()) ||
         !IsSupportedSharedTextureFormat(info->pixel_format)) {
       return;
     }
 
-    auto& orig_handle = data->get_gpu_memory_buffer_handle();
+    const auto& orig_handle = data->is_fenced_d3d11_buffer()
+                                  ? data->get_fenced_d3d11_buffer()->buffer
+                                  : data->get_gpu_memory_buffer_handle();
     if (!IsPlatformSharedTextureHandle(orig_handle)) {
       return;
     }
@@ -190,6 +204,14 @@ void OffScreenVideoConsumer::OnFrameCaptured(
     // The release holder will be released from JS side when `release` called
     texture.releaser_holder = new OffscreenReleaserHolder(std::move(gmb_handle),
                                                           std::move(callbacks));
+#if BUILDFLAG(IS_WIN)
+    if (data->is_fenced_d3d11_buffer()) {
+      auto& fenced = *data->get_fenced_d3d11_buffer();
+      texture.releaser_holder->ready_fence =
+          std::move(fenced.ready_fence);
+      texture.releaser_holder->ready_fence_value = fenced.ready_value;
+    }
+#endif
 
     callback_.Run(content_rect, {}, std::move(texture));
     return;

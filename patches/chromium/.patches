@@ -194,3 +194,4 @@ cherry-pick-46c64c0bd343.patch
 cherry-pick-e06257242608.patch
 cherry-pick-8c6eb64fa8b5.patch
 fix_pages_freezing_under_virtual_time_while_they_wait_for_the_clock.patch
+send_fenced_offscreen_frames_when_chromium_queues_the_copy.patch

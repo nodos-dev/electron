@@ -37,6 +37,14 @@ This section provides a brief summary about how an offscreen frame is generated 
 3. The `WebContents::OnPaint` uses `gin_converter` (`osr_converter.cc`) to convert the `OffscreenSharedTextureValue` to a `v8::Object`. It converts most of the value to a corresponding `v8::Value`, and the handle is converted to a `Buffer`. It also creates a `release` function to destroy the releaser and free the frame we previously took ownership of. The frame can now be reused for further capturing. Finally, it creates a release monitor to detect if the `release` function is called before the garbage collector destroys the JS object; if not, it prints a warning.
 4. The data is then emitted to the `paint` event of `webContents`. You can now grab the data and pass it to your native code for further processing. You can pass the `textureInfo` to other processes using Electron IPC, but you can only `release` it in the main process. Do not keep it for long, or it will drain the buffer pool.
 
+On Windows, `--offscreen-shared-texture-fence` enables early delivery for
+BGRA shared textures with external begin frames. The texture's `handle`
+contains `readyFenceHandle` and `readyFenceValue` (a BigInt). A native
+consumer must enqueue a wait on that fence before reading the texture and
+call `release()` after its GPU reads complete. The handles are borrowed
+until release. `sharedTexture.importSharedTexture` also registers the
+ready fence when the texture is used by a managed consumer.
+
 ### Native Handling
 
 You now have the texture info for the frame. Here's how you should handle it in native code. Suppose you write a node native addon to handle the shared texture.

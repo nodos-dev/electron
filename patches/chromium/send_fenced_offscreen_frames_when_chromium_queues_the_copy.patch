@@ -1,0 +1,385 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Can Oguz <can.oguz@nodos.dev>
+Date: Mon, 9 Nov 2026 12:32:53 +0300
+Subject: Send fenced offscreen frames when Chromium queues the copy
+
+GPU consumers can wait for the capture on their own command queue.
+Export the D3D11 producer fence with the pooled texture after
+submission and keep the existing capture release callback in force.
+
+Job-Id: accelerate-electronode-texture-handoff
+
+diff --git a/components/viz/common/frame_sinks/blit_request.h b/components/viz/common/frame_sinks/blit_request.h
+index a248ed15e0ccce7124fbdde089448d8dc761c059..5ee950a07d418c21dd4f1f2624f2e3e422732469 100644
+--- a/components/viz/common/frame_sinks/blit_request.h
++++ b/components/viz/common/frame_sinks/blit_request.h
+@@ -104,6 +104,13 @@ class VIZ_COMMON_EXPORT BlitRequest {
+     return populates_mappable_shared_image_;
+   }
+ 
++  // Used by in-process Viz capture requests whose consumer can wait on the
++  // producer's D3D11 fence instead of mapping the completed image on the CPU.
++  void RequestD3D11ReadyFence() { requests_d3d11_ready_fence_ = true; }
++  bool requests_d3d11_ready_fence() const {
++    return requests_d3d11_ready_fence_;
++  }
++
+   // Appends a new `BlendBitmap` request to this blit request.
+   // |source_region| is expressed in |image|'s coordinate system
+   // (i.e. 0,0 width x height rectangle). |destination_region| is expressed
+@@ -140,6 +147,7 @@ class VIZ_COMMON_EXPORT BlitRequest {
+   // needs to be sent out only after it's safe to map the SharedImage to
+   // system memory.
+   bool populates_mappable_shared_image_;
++  bool requests_d3d11_ready_fence_ = false;
+ 
+   // Collection of bitmaps that will be blended onto the texture.
+   // They will be blended in order (so if i < j, bitmap at offset i will
+diff --git a/components/viz/common/frame_sinks/copy_output_result.h b/components/viz/common/frame_sinks/copy_output_result.h
+index 7ab3eff974859bbe3c2452cca5279b79de5ddef1..f5f3d7488a0586904095c4bdabc1529604384160 100644
+--- a/components/viz/common/frame_sinks/copy_output_result.h
++++ b/components/viz/common/frame_sinks/copy_output_result.h
+@@ -7,10 +7,12 @@
+ 
+ #include <array>
+ #include <string>
++#include <utility>
+ #include <vector>
+ 
+ #include "base/containers/span.h"
+ #include "base/memory/raw_ptr.h"
++#include "base/memory/ref_counted.h"
+ #include "base/memory/scoped_refptr.h"
+ #include "base/threading/thread_checker.h"
+ #include "components/viz/common/resources/release_callback.h"
+@@ -22,6 +24,7 @@
+ #include "third_party/skia/include/core/SkBitmap.h"
+ #include "ui/gfx/color_space.h"
+ #include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/gpu_fence_handle.h"
+ 
+ class SkBitmap;
+ 
+@@ -33,6 +36,18 @@ namespace viz {
+ // CopyOutputResult instance.
+ class VIZ_COMMON_EXPORT CopyOutputResult {
+  public:
++  struct ReadyFence {
++    gfx::GpuFenceHandle handle;
++    uint64_t value;
++  };
++  using ReadyFenceRef = scoped_refptr<base::RefCountedData<ReadyFence>>;
++
++  void SetReadyFence(gfx::GpuFenceHandle handle, uint64_t value) {
++    ready_fence_ = base::MakeRefCounted<base::RefCountedData<ReadyFence>>(
++        ReadyFence{std::move(handle), value});
++  }
++  const ReadyFenceRef& ready_fence() const { return ready_fence_; }
++
+   enum class Format : uint8_t {
+     // A normal bitmap. When the results are returned in system memory, the
+     // AsSkBitmap() will return a bitmap in "N32Premul" form. When the results
+@@ -252,6 +267,7 @@ class VIZ_COMMON_EXPORT CopyOutputResult {
+   mutable SkBitmap cached_bitmap_;
+ 
+   TrackedElementRects tracked_element_rects_;
++  ReadyFenceRef ready_fence_;
+ };
+ 
+ // Subclass of CopyOutputResult that provides a RGBA result from an
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+index d8485e68ef15f944a4d45facf2b6447a53412944..58a148b2de6988c7b5256b5654ea4753ab12383b 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -4,6 +4,10 @@
+ 
+ #include "components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h"
+ 
++#if BUILDFLAG(IS_WIN)
++#include "ui/gfx/win/d3d_shared_fence.h"
++#endif
++
+ #include <memory>
+ #include <optional>
+ #include <string>
+@@ -1058,7 +1062,29 @@ void SkiaOutputSurfaceImplOnGpu::CopyOutputRGBAInTexture(
+                         request->blit_request());
+   }
+ 
+-  bool should_submit_gr_context = !end_semaphores.empty();
++  const bool export_ready_fence =
++      request->has_blit_request() &&
++      request->blit_request().requests_d3d11_ready_fence();
++  if (export_ready_fence) {
++#if BUILDFLAG(IS_WIN)
++    if (gr_context() && context_state_->IsUsingGL() &&
++        !capture_ready_fence_) {
++      auto device = context_state_->GetD3D11Device();
++      if (device) {
++        capture_ready_fence_ = gfx::D3DSharedFence::CreateForD3D11(device);
++      }
++    }
++    if (!capture_ready_fence_) {
++      LOG(ERROR) << "Fenced capture requires a D3D11 ANGLE compositor";
++      return;
++    }
++#else
++    LOG(ERROR) << "D3D11 fenced capture requires Windows";
++    return;
++#endif
++  }
++  const bool should_submit_gr_context =
++      !end_semaphores.empty() || export_ready_fence;
+ 
+   // If we are not the ones allocating the textures, they may come from a
+   // GMB, in which case we need to delay sending the results until we
+@@ -1066,7 +1092,7 @@ void SkiaOutputSurfaceImplOnGpu::CopyOutputRGBAInTexture(
+   // memory-mapping the GMB may not yield the latest version of the
+   // contents.
+   const bool should_wait_for_gpu_work =
+-      request->has_blit_request() &&
++      !export_ready_fence && request->has_blit_request() &&
+       request->blit_request().populates_mappable_shared_image();
+ 
+   std::unique_ptr<ReadbackContextTexture> readback_context;
+@@ -1139,10 +1165,27 @@ void SkiaOutputSurfaceImplOnGpu::CopyOutputRGBAInTexture(
+   DCHECK(request);
+ 
+   if (request->has_blit_request()) {
+-    request->SendResult(std::make_unique<CopyOutputSharedImageResult>(
++    auto result = std::make_unique<CopyOutputSharedImageResult>(
+         CopyOutputResult::Format::RGBA, geometry.result_selection,
+         request->blit_request().shared_image(),
+-        std::move(blit_release_callback)));
++        std::move(blit_release_callback));
++#if BUILDFLAG(IS_WIN)
++    if (export_ready_fence) {
++      // Ganesh has submitted its GL work to ANGLE's D3D11 context. Signal on
++      // that same context and flush the signal before exporting its point.
++      if (!capture_ready_fence_->IncrementAndSignalD3D11()) {
++        return;
++      }
++      Microsoft::WRL::ComPtr<ID3D11DeviceContext> context;
++      capture_ready_fence_->GetD3D11Device()->GetImmediateContext(&context);
++      context->Flush();
++      gfx::GpuFenceHandle handle;
++      handle.Adopt(capture_ready_fence_->CloneSharedHandle());
++      result->SetReadyFence(std::move(handle),
++                            capture_ready_fence_->GetFenceValue());
++    }
++#endif
++    request->SendResult(std::move(result));
+   } else {
+     DCHECK(!blit_release_callback);
+     // Grab the mailbox before we transfer `representation`'s ownership:
+diff --git a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+index 5f5430b277685c880e633a439bdf6e9b0730c69c..9d11d6f02035d22ba97e788f43a8e8801b7028ea 100644
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.h
+@@ -55,6 +55,9 @@
+ #endif
+ 
+ namespace gfx {
++#if BUILDFLAG(IS_WIN)
++class D3DSharedFence;
++#endif
+ namespace mojom {
+ class DelegatedInkPointRenderer;
+ }  // namespace mojom
+@@ -533,6 +536,9 @@ class SkiaOutputSurfaceImplOnGpu
+   scoped_refptr<gl::GLSurface> gl_surface_;
+   raw_ptr<gl::Presenter> presenter_ = nullptr;
+   scoped_refptr<gpu::SharedContextState> context_state_;
++#if BUILDFLAG(IS_WIN)
++  scoped_refptr<gfx::D3DSharedFence> capture_ready_fence_;
++#endif
+   size_t max_resource_cache_bytes_ = 0u;
+ 
+   bool context_is_lost_ = false;
+diff --git a/components/viz/service/frame_sinks/video_capture/frame_sink_video_capturer_impl.cc b/components/viz/service/frame_sinks/video_capture/frame_sink_video_capturer_impl.cc
+index 719a1c8ef890a9d945caba7ad7d347885ae4dc28..a2c38965c4bd49dc890299179db5944be938df6a 100644
+--- a/components/viz/service/frame_sinks/video_capture/frame_sink_video_capturer_impl.cc
++++ b/components/viz/service/frame_sinks/video_capture/frame_sink_video_capturer_impl.cc
+@@ -118,6 +118,7 @@ std::unique_ptr<VideoFramePool> GetVideoFramePoolForFormat(
+                              : gfx::ColorSpace::CreateSRGBLinear();
+       switch (buffer_format_preference) {
+         case mojom::BufferFormatPreference::kPreferMappableSharedImage:
++        case mojom::BufferFormatPreference::kPreferFencedMappableSharedImage:
+         case mojom::BufferFormatPreference::kPreferSharedImageWithNativeHandle:
+           return std::make_unique<MappableSharedImageVideoFramePool>(
+               capacity, format, color_space, context_provider,
+@@ -901,7 +902,12 @@ void FrameSinkVideoCapturerImpl::MaybeCaptureFrame(
+   CHECK(!source_size.IsEmpty());
+   CHECK_EQ(region_properties->render_pass_subrect.size(), source_size);
+ 
+-  const bool can_resurrect_content = CanResurrectFrame(capture_size);
++  const bool fenced_capture =
++      buffer_format_preference_ ==
++      mojom::BufferFormatPreference::kPreferFencedMappableSharedImage;
++  // Each fenced delivery carries the readiness point of its own copy.
++  const bool can_resurrect_content =
++      !fenced_capture && CanResurrectFrame(capture_size);
+   scoped_refptr<VideoFrame> frame;
+   if (can_resurrect_content) {
+     TRACE_EVENT_INSTANT("gpu.capture", "UsingResurrectedFrame");
+@@ -1123,8 +1129,8 @@ void FrameSinkVideoCapturerImpl::MaybeCaptureFrame(
+   // be necessary but video capture is started with I420+mappable SI in tests.
+   // That still captures software I420 frames and not textures.
+   const bool capture_texture_results =
+-      buffer_format_preference_ ==
+-          mojom::BufferFormatPreference::kPreferMappableSharedImage &&
++      (fenced_capture || buffer_format_preference_ ==
++          mojom::BufferFormatPreference::kPreferMappableSharedImage) &&
+       (pixel_format_ == media::PIXEL_FORMAT_NV12 ||
+        pixel_format_ == media::PIXEL_FORMAT_ARGB ||
+        pixel_format_ == media::PIXEL_FORMAT_RGBAF16);
+@@ -1141,6 +1147,9 @@ void FrameSinkVideoCapturerImpl::MaybeCaptureFrame(
+         BlitRequest(content_rect.origin(), LetterboxingBehavior::kLetterbox,
+                     frame_capture.frame->shared_image(), sync_token,
+                     /*populates_mappable_shared_image=*/true);
++    if (fenced_capture) {
++      blit_request->RequestD3D11ReadyFence();
++    }
+ 
+     // We haven't captured the frame yet, but let's pretend that we did for
+     // the sake of blend information computation. We will be asking for an
+@@ -1350,13 +1359,17 @@ void FrameSinkVideoCapturerImpl::DidCopyFrame(
+         frame_capture.CaptureFailed(CaptureResult::kARGBReadbackFailed);
+       }
+     } else {
+-      CHECK_EQ(buffer_format_preference_,
+-               mojom::BufferFormatPreference::kPreferMappableSharedImage);
++      const bool fenced_capture =
++          buffer_format_preference_ ==
++          mojom::BufferFormatPreference::kPreferFencedMappableSharedImage;
++      CHECK(fenced_capture || buffer_format_preference_ ==
++                                  mojom::BufferFormatPreference::kPreferMappableSharedImage);
+       // MappableSI ARGB results are written to the existing pool texture.
+-      if (result->IsEmpty()) {
++      if (result->IsEmpty() || (fenced_capture && !result->ready_fence())) {
+         frame_capture.CaptureFailed(
+             CaptureResult::kMappableSharedImageReadbackFailed);
+       } else {
++        frame_capture.ready_fence = result->ready_fence();
+         UMA_HISTOGRAM_CAPTURE_DURATION(
+             "RGBA", base::TimeTicks::Now() - frame_capture.request_time);
+         frame_capture.CaptureSucceeded();
+@@ -1416,7 +1429,8 @@ void FrameSinkVideoCapturerImpl::DidCopyFrame(
+       media::LetterboxVideoFrame(frame.get(), result_rect);
+     }
+ 
+-    if (ShouldMark(*frame, frame_capture.content_version)) {
++    if (!frame_capture.ready_fence &&
++        ShouldMark(*frame, frame_capture.content_version)) {
+       MarkFrame(frame, frame_capture.content_version);
+     }
+   }
+@@ -1520,6 +1534,15 @@ void FrameSinkVideoCapturerImpl::MaybeDeliverFrame(FrameCapture frame_capture) {
+   CHECK(handle);
+   CHECK(!handle->is_read_only_shmem_region() ||
+         handle->get_read_only_shmem_region().IsValid());
++  if (frame_capture.ready_fence) {
++    const auto& ready = frame_capture.ready_fence->data;
++    CHECK(handle->is_gpu_memory_buffer_handle());
++    auto fenced = media::mojom::FencedD3D11CaptureBuffer::New(
++        std::move(handle->get_gpu_memory_buffer_handle()),
++        ready.handle.Clone(), ready.value);
++    handle = media::mojom::VideoBufferHandle::NewFencedD3d11Buffer(
++        std::move(fenced));
++  }
+ 
+   // Assemble frame layout, format, and metadata into a mojo struct to send to
+   // the consumer.
+diff --git a/components/viz/service/frame_sinks/video_capture/frame_sink_video_capturer_impl.h b/components/viz/service/frame_sinks/video_capture/frame_sink_video_capturer_impl.h
+index 104f1ab6baa233a2f7800fb9975b03015e647314..044239ed26beb1cb656c132c68d9479b49202c13 100644
+--- a/components/viz/service/frame_sinks/video_capture/frame_sink_video_capturer_impl.h
++++ b/components/viz/service/frame_sinks/video_capture/frame_sink_video_capturer_impl.h
+@@ -22,6 +22,7 @@
+ #include "base/time/time.h"
+ #include "base/timer/timer.h"
+ #include "base/unguessable_token.h"
++#include "components/viz/common/frame_sinks/copy_output_result.h"
+ #include "components/viz/common/quads/compositor_frame_metadata.h"
+ #include "components/viz/common/surfaces/frame_sink_id.h"
+ #include "components/viz/common/surfaces/video_capture_target.h"
+@@ -48,7 +49,6 @@ class Size;
+ 
+ namespace viz {
+ 
+-class CopyOutputResult;
+ class FrameSinkVideoCapturerManager;
+ class GmbVideoFramePoolContextProvider;
+ 
+@@ -337,6 +337,7 @@ class VIZ_SERVICE_EXPORT FrameSinkVideoCapturerImpl final
+ 
+     // The actual frame.
+     scoped_refptr<media::VideoFrame> frame;
++    CopyOutputResult::ReadyFenceRef ready_fence;
+ 
+     // When the request for capture was made.
+     base::TimeTicks request_time;
+diff --git a/media/capture/mojom/video_capture_buffer.mojom b/media/capture/mojom/video_capture_buffer.mojom
+index a9373b9baf6f2ce4f5600eb2a7c8510a026087db..ce6d435bc0b702bdd872b563b0b5d3c3cf7e9aa4 100644
+--- a/media/capture/mojom/video_capture_buffer.mojom
++++ b/media/capture/mojom/video_capture_buffer.mojom
+@@ -13,6 +13,14 @@ import "mojo/public/mojom/base/time.mojom";
+ import "ui/gfx/geometry/mojom/geometry.mojom";
+ import "ui/gfx/mojom/buffer_types.mojom";
+ import "ui/gfx/mojom/color_space.mojom";
++import "ui/gfx/mojom/gpu_fence_handle.mojom";
++
++// A shared image and a timeline point on the D3D11 queue writing it.
++struct FencedD3D11CaptureBuffer {
++  gfx.mojom.GpuMemoryBufferHandle buffer;
++  gfx.mojom.GpuFenceHandle ready_fence;
++  uint64 ready_value;
++};
+ 
+ struct VideoFrameInfo {
+   mojo_base.mojom.TimeDelta timestamp;
+@@ -63,4 +71,5 @@ union VideoBufferHandle {
+   mojo_base.mojom.ReadOnlySharedMemoryRegion read_only_shmem_region;
+   SharedImageBufferHandleSet shared_image_handle;
+   gfx.mojom.GpuMemoryBufferHandle gpu_memory_buffer_handle;
++  FencedD3D11CaptureBuffer fenced_d3d11_buffer;
+ };
+diff --git a/services/viz/privileged/mojom/compositing/frame_sink_video_capture.mojom b/services/viz/privileged/mojom/compositing/frame_sink_video_capture.mojom
+index 0cbf840adcb9739ac8bb8ba96c24a2895b145295..760b4a80dc8dc854fd080e119b6e291bd356127f 100644
+--- a/services/viz/privileged/mojom/compositing/frame_sink_video_capture.mojom
++++ b/services/viz/privileged/mojom/compositing/frame_sink_video_capture.mojom
+@@ -98,7 +98,10 @@ enum BufferFormatPreference {
+   // mappable, allowing for more efficient GPU usage. This option is useful
+   // when the consumer does not need CPU access to the frame but requires
+   // interop with other GPU pipelines or platforms.
+-  kPreferSharedImageWithNativeHandle
++  kPreferSharedImageWithNativeHandle,
++  // Windows GPU consumers wait for the delivered ready fence before reading
++  // the shared texture. Done still means all consumer reads have completed.
++  kPreferFencedMappableSharedImage
+ };
+ 
+ // Interface to an implementation that captures the frames of a
+diff --git a/third_party/blink/renderer/platform/video_capture/video_capture_impl.cc b/third_party/blink/renderer/platform/video_capture/video_capture_impl.cc
+index 0b376052ea8b2c8da292ff5bd282ad72a367e8bd..7ceb41de679d60fea16a0ff03ca595060b63ba89 100644
+--- a/third_party/blink/renderer/platform/video_capture/video_capture_impl.cc
++++ b/third_party/blink/renderer/platform/video_capture/video_capture_impl.cc
+@@ -109,6 +109,9 @@ struct VideoCaptureImpl::BufferContext
+         InitializeFromGpuMemoryBufferHandle(
+             std::move(buffer_handle->get_gpu_memory_buffer_handle()));
+         break;
++      case VideoFrameBufferHandleType::kFencedD3d11Buffer:
++        // This consumer never requests fenced offscreen capture.
++        break;
+     }
+   }
+   BufferContext(const BufferContext&) = delete;
+@@ -278,6 +281,9 @@ bool VideoCaptureImpl::ProcessBuffer(
+       .buffer_context = buffer_context};
+ 
+   switch (buffer_context->buffer_type()) {
++    case VideoFrameBufferHandleType::kFencedD3d11Buffer:
++      LOG(ERROR) << "This video consumer cannot import fenced captures";
++      return false;
+     case VideoFrameBufferHandleType::kUnsafeShmemRegion:
+       // The frame is backed by a writable (unsafe) shared memory handle, but as
+       // it is not sent cross-process the region does not need to be attached to

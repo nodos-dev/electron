@@ -173,6 +173,10 @@ struct ImportedSharedTexture
   // Holds a reference to prevent it from being destroyed.
   scoped_refptr<gpu::ClientSharedImage> client_shared_image;
   gpu::SyncToken frame_creation_sync_token;
+#if BUILDFLAG(IS_WIN)
+  scoped_refptr<gfx::D3DSharedFence> ready_fence;
+  gpu::SyncToken last_source_token;
+#endif
   base::Lock release_sync_token_lock_;
   gpu::SyncToken release_sync_token GUARDED_BY(release_sync_token_lock_);
   base::OnceClosure release_callback;
@@ -231,7 +235,8 @@ struct ImportedSharedTextureWrapper {
   }
 
   // Create VideoFrame from the shared image.
-  v8::Local<v8::Value> CreateVideoFrame(v8::Isolate* isolate);
+  v8::Local<v8::Value> CreateVideoFrame(v8::Isolate* isolate,
+                                       const gpu::SyncToken& acquire_token);
 
   // Release the shared image.
   bool IsReferenceReleased() const { return ist.get() == nullptr; }
@@ -258,7 +263,8 @@ ImportedSharedTexture::CreateFrameReleaseCallback() {
 }
 
 v8::Local<v8::Value> ImportedSharedTextureWrapper::CreateVideoFrame(
-    v8::Isolate* isolate) {
+    v8::Isolate* isolate,
+    const gpu::SyncToken& acquire_token) {
   auto* current_script_state = blink::ScriptState::ForCurrentRealm(isolate);
   auto* current_execution_context =
       blink::ToExecutionContext(current_script_state);
@@ -268,7 +274,7 @@ v8::Local<v8::Value> ImportedSharedTextureWrapper::CreateVideoFrame(
 
   scoped_refptr<media::VideoFrame> raw_frame =
       media::VideoFrame::WrapSharedImage(
-          ist->pixel_format, si, ist->frame_creation_sync_token, std::move(cb),
+          ist->pixel_format, si, acquire_token, std::move(cb),
           ist->visible_rect, ist->coded_size,
           base::Microseconds(ist->timestamp));
 
@@ -414,9 +420,66 @@ void ImportedTextureGetVideoFrame(
     return;
   }
 
-  auto ret = wrapper->CreateVideoFrame(isolate);
+  gpu::SyncToken acquire_token = wrapper->ist->frame_creation_sync_token;
+#if BUILDFLAG(IS_WIN)
+  if (!info[0]->IsUndefined()) {
+    std::string encoded;
+    if (!gin::ConvertFromV8(isolate, info[0], &encoded)) {
+      gin_helper::ErrorThrower(isolate).ThrowTypeError(
+          "Expected a shared texture acquire token.");
+      return;
+    }
+    acquire_token = GetSyncTokenFromBase64String(encoded);
+    auto& last_token = wrapper->ist->last_source_token;
+    if (!acquire_token.HasData() || !acquire_token.verified_flush() ||
+        acquire_token.namespace_id() != last_token.namespace_id() ||
+        acquire_token.command_buffer_id() != last_token.command_buffer_id() ||
+        acquire_token.release_count() <= last_token.release_count()) {
+      gin_helper::ErrorThrower(isolate).ThrowTypeError(
+          "Expected a newer acquire token from the texture's source.");
+      return;
+    }
+    last_token = acquire_token;
+  }
+#endif
+  auto ret = wrapper->CreateVideoFrame(isolate, acquire_token);
   info.GetReturnValue().Set(ret);
 }
+
+#if BUILDFLAG(IS_WIN)
+void ImportedTextureUpdateReadyFence(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  auto* isolate = info.GetIsolate();
+  auto* wrapper = static_cast<ImportedSharedTextureWrapper*>(
+      info.Data().As<v8::External>()->Value(
+          v8::kExternalPointerTypeTagDefault));
+  bool lossless = false;
+  const uint64_t value =
+      info[0]->IsBigInt() ? info[0].As<v8::BigInt>()->Uint64Value(&lossless) : 0;
+  if (!IsBrowserProcess() || wrapper->IsReferenceReleased() ||
+      !wrapper->ist->ready_fence || !lossless ||
+      value <= wrapper->ist->ready_fence->GetFenceValue()) {
+    gin_helper::ErrorThrower(isolate).ThrowTypeError(
+        "Expected an imported fenced texture and an increasing fence value.");
+    return;
+  }
+  auto* sii = GetSharedImageInterface();
+  if (!sii) {
+    gin_helper::ErrorThrower(isolate).ThrowError(
+        "Failed to update shared texture readiness: GPU is not available");
+    return;
+  }
+  auto& texture = *wrapper->ist;
+  texture.ready_fence->Update(value);
+  sii->UpdateSharedImage(texture.frame_creation_sync_token, texture.ready_fence,
+                         texture.client_shared_image->mailbox());
+  // Publish the fence update to the GPU service before exporting the token
+  // across channels. The D3D fence itself is waited on by the GPU reader.
+  texture.frame_creation_sync_token = sii->GenVerifiedSyncToken();
+  info.GetReturnValue().Set(gin::ConvertToV8(
+      isolate, GetBase64StringFromSyncToken(texture.frame_creation_sync_token)));
+}
+#endif
 
 void ImportedTextureStartTransferSharedTexture(
     const v8::FunctionCallbackInfo<v8::Value>& info) {
@@ -564,6 +627,14 @@ v8::Local<v8::Value> CreateImportedSharedTextureFromSharedImage(
   root.Set("startTransferSharedTexture", start_transfer);
   root.Set("getFrameCreationSyncToken", get_frame_creation_sync_token);
   root.Set("setReleaseSyncToken", set_release_sync_token);
+#if BUILDFLAG(IS_WIN)
+  if (imported->ready_fence) {
+    root.Set("updateReadyFence",
+             v8::Function::New(isolate->GetCurrentContext(),
+                               ImportedTextureUpdateReadyFence, imported_wrapped)
+                 .ToLocalChecked());
+  }
+#endif
 
   return gin::ConvertToV8(isolate, root);
 }
@@ -867,9 +938,9 @@ v8::Local<v8::Value> ImportSharedTexture(v8::Isolate* isolate,
   imported->frame_creation_sync_token = si->creation_sync_token();
 #if BUILDFLAG(IS_WIN)
   if (ready_fence) {
-    sii->UpdateSharedImage(si->creation_sync_token(), std::move(ready_fence),
-                           si->mailbox());
+    sii->UpdateSharedImage(si->creation_sync_token(), ready_fence, si->mailbox());
     imported->frame_creation_sync_token = sii->GenVerifiedSyncToken();
+    imported->ready_fence = std::move(ready_fence);
   }
 #endif
   imported->client_shared_image = std::move(si);
@@ -925,6 +996,9 @@ v8::Local<v8::Value> FinishTransferSharedTexture(v8::Isolate* isolate,
   imported->visible_rect = partial.visible_rect;
   imported->timestamp = partial.timestamp;
   imported->frame_creation_sync_token = sii->GenUnverifiedSyncToken();
+#if BUILDFLAG(IS_WIN)
+  imported->last_source_token = source_st;
+#endif
   imported->client_shared_image = std::move(si);
   imported->id = id;
 
@@ -942,6 +1016,7 @@ void Initialize(v8::Local<v8::Object> exports,
   v8::Isolate* const isolate = v8::Isolate::GetCurrent();
   gin_helper::Dictionary dict(isolate, exports);
   dict.Set("supportsReadyFence", BUILDFLAG(IS_WIN));
+  dict.Set("supportsPersistentReadyFence", BUILDFLAG(IS_WIN));
   dict.SetMethod("importSharedTexture",
                  &electron::api::shared_texture::ImportSharedTexture);
   dict.SetMethod("finishTransferSharedTexture",

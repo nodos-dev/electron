@@ -31,6 +31,9 @@
 #include "third_party/blink/renderer/platform/graphics/gpu/shared_gpu_context.h"  // nogncheck
 #include "ui/compositor/compositor.h"
 
+#if BUILDFLAG(IS_WIN)
+#include "ui/gfx/win/d3d_shared_fence.h"
+#endif
 #if BUILDFLAG(IS_LINUX)
 #include "base/posix/eintr_wrapper.h"
 #include "base/strings/string_number_conversions.h"
@@ -603,6 +606,8 @@ struct ImportSharedTextureInfo {
   // must be a handle already duplicated for the current process and can be
   // owned by this.
   uintptr_t nt_handle = 0;
+  uintptr_t ready_fence_handle = 0;
+  uint64_t ready_fence_value = 0;
 #elif BUILDFLAG(IS_APPLE)
   // On macOS, it is an IOSurfaceRef, this must be a valid IOSurface at the
   // current process.
@@ -675,6 +680,22 @@ struct Converter<ImportSharedTextureInfo> {
 
 #if BUILDFLAG(IS_WIN)
     GetNativeHandle("ntHandle", &out->nt_handle);
+    GetNativeHandle("readyFenceHandle", &out->ready_fence_handle);
+    v8::Local<v8::Value> ready_value;
+    const bool has_ready_value =
+        shared_texture.Get("readyFenceValue", &ready_value) &&
+        !ready_value->IsUndefined();
+    if (has_ready_value || out->ready_fence_handle) {
+      if (!has_ready_value || !ready_value->IsBigInt() ||
+          !out->ready_fence_handle) {
+        return false;
+      }
+      bool lossless = false;
+      out->ready_fence_value = ready_value.As<v8::BigInt>()->Uint64Value(&lossless);
+      if (!lossless || !out->ready_fence_value) {
+        return false;
+      }
+    }
 #elif BUILDFLAG(IS_APPLE)
     GetNativeHandle("ioSurface", &out->io_surface);
 #elif BUILDFLAG(IS_LINUX)
@@ -746,6 +767,22 @@ v8::Local<v8::Value> ImportSharedTexture(v8::Isolate* isolate,
 
   auto dxgi_handle = gfx::DXGIHandle(base::win::ScopedHandle(dup_handle));
   gmb_handle = gfx::GpuMemoryBufferHandle(std::move(dxgi_handle));
+  scoped_refptr<gfx::D3DSharedFence> ready_fence;
+  if (shared_texture.ready_fence_handle) {
+    HANDLE fence_handle;
+    if (!DuplicateHandle(
+            GetCurrentProcess(),
+            reinterpret_cast<HANDLE>(shared_texture.ready_fence_handle),
+            GetCurrentProcess(), &fence_handle, 0, FALSE,
+            DUPLICATE_SAME_ACCESS)) {
+      gin_helper::ErrorThrower(isolate).ThrowTypeError(
+          "Unable to duplicate capture ready fence");
+      return v8::Null(isolate);
+    }
+    ready_fence = gfx::D3DSharedFence::CreateFromScopedHandle(
+        base::win::ScopedHandle(fence_handle), gfx::DXGIHandleToken());
+    ready_fence->Update(shared_texture.ready_fence_value);
+  }
 #elif BUILDFLAG(IS_APPLE)
   if (shared_texture.io_surface == 0) {
     gin_helper::ErrorThrower(isolate).ThrowTypeError("Invalid ioSurface value");
@@ -828,6 +865,13 @@ v8::Local<v8::Value> ImportSharedTexture(v8::Isolate* isolate,
   imported->visible_rect = shared_texture.visible_rect;
   imported->timestamp = shared_texture.timestamp;
   imported->frame_creation_sync_token = si->creation_sync_token();
+#if BUILDFLAG(IS_WIN)
+  if (ready_fence) {
+    sii->UpdateSharedImage(si->creation_sync_token(), std::move(ready_fence),
+                           si->mailbox());
+    imported->frame_creation_sync_token = sii->GenVerifiedSyncToken();
+  }
+#endif
   imported->client_shared_image = std::move(si);
   imported->id = shared_texture.id;
 
@@ -897,6 +941,7 @@ void Initialize(v8::Local<v8::Object> exports,
                 void* priv) {
   v8::Isolate* const isolate = v8::Isolate::GetCurrent();
   gin_helper::Dictionary dict(isolate, exports);
+  dict.Set("supportsReadyFence", BUILDFLAG(IS_WIN));
   dict.SetMethod("importSharedTexture",
                  &electron::api::shared_texture::ImportSharedTexture);
   dict.SetMethod("finishTransferSharedTexture",

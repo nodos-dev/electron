@@ -1,0 +1,112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Can Oguz <can.oguz@nodos.dev>
+Date: Mon, 9 Nov 2026 13:32:49 +0300
+Subject: Fix Chromium reading fenced textures before they are ready
+
+Advance the sync token after registering a D3D fence and after waiting
+on the producer token. Forward the external fence through the compound
+image backing and keep registration state with its mailbox.
+
+Job-Id: accelerate-electronode-texture-inputs
+
+diff --git a/gpu/command_buffer/service/shared_image/compound_image_backing.cc b/gpu/command_buffer/service/shared_image/compound_image_backing.cc
+index 65bbf02e8b43a7f9ddbfd5e69cbb80398d5fa3f3..bf31acb63aaa5beecdb8989b9185587e2d5afd06 100644
+--- a/gpu/command_buffer/service/shared_image/compound_image_backing.cc
++++ b/gpu/command_buffer/service/shared_image/compound_image_backing.cc
+@@ -1449,6 +1449,20 @@ void CompoundImageBacking::Update(std::unique_ptr<gfx::GpuFence> in_fence) {
+   element.content_id_ = ++latest_content_id_;
+ }
+ 
++#if BUILDFLAG(IS_WIN)
++void CompoundImageBacking::UpdateExternalFence(
++    scoped_refptr<gfx::D3DSharedFence> external_fence) {
++  AutoLock auto_lock(this);
++  CHECK(!elements_.empty());
++  // The first backing owns the imported resource written by the producer.
++  // Copies into any sibling backing must read from it after the fence.
++  auto& element = elements_.front();
++  CHECK(element.backing);
++  element.backing->UpdateExternalFence(std::move(external_fence));
++  element.content_id_ = ++latest_content_id_;
++}
++#endif
++
+ bool CompoundImageBacking::CopyToGpuMemoryBuffer() {
+   AutoLock auto_lock(this);
+   auto& shm_element = GetShmElement();
+diff --git a/gpu/command_buffer/service/shared_image/compound_image_backing.h b/gpu/command_buffer/service/shared_image/compound_image_backing.h
+index cbe5bd33dcb615098ed41900be2c9db460036bfb..1741ba0164f8c8986eec20e53375932f44be44bb 100644
+--- a/gpu/command_buffer/service/shared_image/compound_image_backing.h
++++ b/gpu/command_buffer/service/shared_image/compound_image_backing.h
+@@ -220,6 +220,10 @@ class GPU_GLES2_EXPORT CompoundImageBacking
+   bool IsPurgeable() const override;
+   SharedImageBackingType GetType() const override;
+   void Update(std::unique_ptr<gfx::GpuFence> in_fence) override;
++#if BUILDFLAG(IS_WIN)
++  void UpdateExternalFence(
++      scoped_refptr<gfx::D3DSharedFence> external_fence) override;
++#endif
+   bool CopyToGpuMemoryBuffer() override;
+   void CopyToGpuMemoryBufferAsync(
+       base::OnceCallback<void(bool)> callback) override;
+diff --git a/gpu/ipc/client/shared_image_interface_proxy.cc b/gpu/ipc/client/shared_image_interface_proxy.cc
+index afe6e4ec5d572b8a8b4b366084aa786b39898ad1..b8b5b0d13f3d6aac04ddef2068a851cee51354d7 100644
+--- a/gpu/ipc/client/shared_image_interface_proxy.cc
++++ b/gpu/ipc/client/shared_image_interface_proxy.cc
+@@ -258,8 +258,11 @@ void SharedImageInterfaceProxy::UpdateSharedImage(
+   std::vector<SyncToken> dependencies =
+       GenerateDependenciesFromSyncToken(std::move(sync_token), host_);
+   // Register fence in gpu process in first update.
+-  auto [token_it, inserted] =
+-      registered_fence_tokens_.insert(d3d_shared_fence->GetDXGIHandleToken());
++  auto image = mailbox_infos_.find(mailbox);
++  CHECK(image != mailbox_infos_.end());
++  const bool inserted = image->second.registered_fence_tokens
++                            .insert(d3d_shared_fence->GetDXGIHandleToken())
++                            .second;
+   if (inserted) {
+     gfx::GpuFenceHandle fence_handle;
+     fence_handle.Adopt(d3d_shared_fence->CloneSharedHandle());
+@@ -279,7 +282,7 @@ void SharedImageInterfaceProxy::UpdateSharedImage(
+               mojom::UpdateDxgiFenceParams::New(
+                   mailbox, d3d_shared_fence->GetDXGIHandleToken(),
+                   d3d_shared_fence->GetFenceValue()))),
+-      std::move(dependencies), /*release_count=*/0);
++      std::move(dependencies), ++next_release_id_);
+ }
+ #endif  // BUILDFLAG(IS_WIN)
+ 
+@@ -418,7 +421,7 @@ void SharedImageInterfaceProxy::WaitSyncToken(const SyncToken& sync_token) {
+     last_flush_id_ = host_->EnqueueDeferredMessage(
+         mojom::DeferredRequestParams::NewSharedImageRequest(
+             mojom::DeferredSharedImageRequest::NewNop(0)),
+-        std::move(dependencies), /*release_count=*/0);
++        std::move(dependencies), ++next_release_id_);
+   }
+ }
+ 
+diff --git a/gpu/ipc/client/shared_image_interface_proxy.h b/gpu/ipc/client/shared_image_interface_proxy.h
+index 857f5cc8abd5aa15470ff6891b26a4c0b137e05b..10437168cbd0a94f60dfaa02dcd3e03e3408f58e 100644
+--- a/gpu/ipc/client/shared_image_interface_proxy.h
++++ b/gpu/ipc/client/shared_image_interface_proxy.h
+@@ -59,6 +59,9 @@ class SharedImageInterfaceProxy {
+ 
+     int ref_count = 0;
+     std::vector<SyncToken> destruction_sync_tokens;
++#if BUILDFLAG(IS_WIN)
++    absl::flat_hash_set<gfx::DXGIHandleToken> registered_fence_tokens;
++#endif
+   };
+ 
+   Mailbox CreateSharedImage(const SharedImageInfo& si_info,
+@@ -156,10 +159,6 @@ class SharedImageInterfaceProxy {
+ 
+   const gpu::SharedImageCapabilities capabilities_;
+ 
+-#if BUILDFLAG(IS_WIN)
+-  absl::flat_hash_set<gfx::DXGIHandleToken> registered_fence_tokens_
+-      GUARDED_BY(lock_);
+-#endif
+ };
+ 
+ }  // namespace gpu
